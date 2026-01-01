@@ -31,7 +31,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     // Pan xy
     var panX: Float = 0.0
     var panY: Float = 0.0
-    
+    public var manualTime: Float? = nil
     // Total length of the video/animation in seconds
     var animationDuration: Double = 10.0
     
@@ -107,47 +107,53 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
-        guard let modelRenderer else { return }
-        guard let drawable = view.currentDrawable else { return }
-
         _ = inFlightSemaphore.wait(timeout: DispatchTime.distantFuture)
-
+        
         guard let commandBuffer = commandQueue.makeCommandBuffer() else {
             inFlightSemaphore.signal()
             return
         }
+        commandBuffer.label = "Frame Command Buffer" // Name it for debugging
+        
+        let semaphore = self.inFlightSemaphore
 
-        let semaphore = inFlightSemaphore
-        commandBuffer.addCompletedHandler { (_ commandBuffer)-> Swift.Void in
+        commandBuffer.addCompletedHandler { _ in
             semaphore.signal()
         }
-
-        // Get time
-        let now = Date().timeIntervalSinceReferenceDate
         
-        // Normalize to [0, 1] with animationDuration
-        let loopedTime = now.remainder(dividingBy: animationDuration)
-        let normalizedTime = Float((loopedTime < 0 ? loopedTime + animationDuration : loopedTime) / animationDuration)
-
-        // deform.step
-        if let splatRenderer = modelRenderer as? SplatRenderer {
-            splatRenderer.update(time: normalizedTime, commandBuffer: commandBuffer)
+        guard let drawable = view.currentDrawable else {
+            commandBuffer.commit()
+            return
         }
 
+        // Deformation step
+        let timeToPass: Float
+        if let manualTime = manualTime {
+            timeToPass = manualTime
+        } else {
+            let now = Date().timeIntervalSinceReferenceDate
+            let loopedTime = now.remainder(dividingBy: animationDuration)
+            timeToPass = Float((loopedTime < 0 ? loopedTime + animationDuration : loopedTime) / animationDuration)
+        }
+        
+        if let splatRenderer = modelRenderer as? SplatRenderer {
+            splatRenderer.update(time: timeToPass, commandBuffer: commandBuffer)
+        }
+
+        // Rendering Step
         do {
-            try modelRenderer.render(viewports: [viewport],
+            try modelRenderer?.render(viewports: [viewport],
                                      colorTexture: view.multisampleColorTexture ?? drawable.texture,
                                      colorStoreAction: view.multisampleColorTexture == nil ? .store : .multisampleResolve,
                                      depthTexture: view.depthStencilTexture,
                                      rasterizationRateMap: nil,
                                      renderTargetArrayLength: 0,
-                                     to: commandBuffer)
+                                     to: commandBuffer) // Pass the SAME buffer
         } catch {
             Self.log.error("Unable to render scene: \(error.localizedDescription)")
         }
 
         commandBuffer.present(drawable)
-
         commandBuffer.commit()
     }
 

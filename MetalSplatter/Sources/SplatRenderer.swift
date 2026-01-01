@@ -3,6 +3,7 @@ import Metal
 import MetalKit
 import os
 import SplatIO
+import Accelerate
 
 #if arch(x86_64)
 typealias Float16 = Float
@@ -137,7 +138,6 @@ public class SplatRenderer {
     struct CanonicalSplat {
         var position: MTLPackedFloat3
         var color: SplatRenderer.PackedRGBHalf4
-//        var rotation: SIMD4<Float>
         var rotationX: Float
         var rotationY: Float
         var rotationZ: Float
@@ -147,8 +147,17 @@ public class SplatRenderer {
     
     // Deformation Support
     var canonicalBuffer: MetalBuffer<CanonicalSplat>?
-    var mlpWeightsBuffer: MTLBuffer?
-    var deformationPipeline: MTLComputePipelineState?
+    var deformSystem: DeformGraphSystem?
+    var extractPipeline: MTLComputePipelineState?
+    var applyPipeline: MTLComputePipelineState?
+
+    // Intermediate Buffers
+    var bufXYZ: MTLBuffer?
+    var bufT: MTLBuffer?
+    var bufDXYZ: MTLBuffer?
+    var bufDRot: MTLBuffer?
+    var bufDScale: MTLBuffer?
+    private var lastDeformationTime: Float = -1.0
     
     public let device: MTLDevice
     public let colorFormat: MTLPixelFormat
@@ -463,24 +472,100 @@ public class SplatRenderer {
         
         // Load the mlp weight
         let weightsData = try Data(contentsOf: weightsURL)
-        self.mlpWeightsBuffer = weightsData.withUnsafeBytes { rawBuffer in
-            device.makeBuffer(bytes: rawBuffer.baseAddress!, length: weightsData.count, options: .storageModeShared)
+        
+        // Initialize the MPS deformation network
+        self.deformSystem = DeformGraphSystem(device: device)
+        self.deformSystem?.loadWeights(flatData: weightsData)
+        self.deformSystem?.buildAndCompile()
+        
+        // Init Kernels
+        let lib = self.library
+        
+        guard let extractFunc = lib.makeFunction(name: "extract_graph_inputs"),
+              let applyFunc = lib.makeFunction(name: "apply_graph_outputs") else {
+            print("Error: Could not find Deform.metal shader functions.")
+            return
         }
+
+        self.extractPipeline = try await device.makeComputePipelineState(function: extractFunc)
+        self.applyPipeline = try await device.makeComputePipelineState(function: applyFunc)
         
-        // Load the canonical scene
+        // Read canonical Gaussians
         let reader = try SplatPLYSceneReader(plyURL)
-        let points = try await readPointsFrom(reader: reader) // Helper function below
+        let points = try await readPointsFrom(reader: reader)
         
-        // Conver to CanonicalSplat and go to device
         let canonicalSplats = points.map { CanonicalSplat($0) }
+        
         self.canonicalBuffer = try MetalBuffer(device: device, capacity: canonicalSplats.count)
         self.canonicalBuffer?.append(canonicalSplats)
         
         try self.splatBuffer.setCapacity(canonicalSplats.count)
         self.splatBuffer.count = canonicalSplats.count
         
-        try buildDeformationPipeline()
+        // Allocate Buffers
+        let count = canonicalBuffer?.count ?? 0
+        Self.log.debug("canonical buffer count: \(count)")
         
+        if count > 0 {
+            bufXYZ = device.makeBuffer(length: count * 3 * 4, options: .storageModePrivate)
+            bufT   = device.makeBuffer(length: count * 1 * 4, options: .storageModePrivate)
+            bufDXYZ = device.makeBuffer(length: count * 3 * 4, options: .storageModePrivate)
+            bufDRot = device.makeBuffer(length: count * 4 * 4, options: .storageModePrivate)
+            bufDScale = device.makeBuffer(length: count * 3 * 4, options: .storageModePrivate)
+        }
+        
+        guard let queue = device.makeCommandQueue(),
+              let sys = deformSystem,
+              let extractPipe = extractPipeline,
+              let applyPipe = applyPipeline,
+              let cBuffer = canonicalBuffer?.buffer,
+              let bXYZ = bufXYZ, let bT = bufT,
+              let bDXYZ = bufDXYZ, let bDRot = bufDRot, let bDScale = bufDScale else { return }
+
+        // Extract xyz from canonical Gaussians and send t=0.0
+        if let cmdA = queue.makeCommandBuffer(),
+           let enc = cmdA.makeComputeCommandEncoder() {
+            enc.label = "Init: Extract"
+            enc.setComputePipelineState(extractPipe)
+            enc.setBuffer(cBuffer, offset: 0, index: 0)
+            enc.setBuffer(bXYZ, offset: 0, index: 1)
+            enc.setBuffer(bT, offset: 0, index: 2)
+            var t = 0.0
+            enc.setBytes(&t, length: 4, index: 3)
+            let w = extractPipe.threadExecutionWidth
+            enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
+            enc.endEncoding()
+            cmdA.commit()
+            cmdA.waitUntilCompleted()
+        }
+        
+        // Calculate d_xyz, d_rotation, d_scaling
+        sys.run(commandQueue: queue,
+                xyzBuffer: bXYZ,
+                tBuffer: bT,
+                outXYZ: bDXYZ,
+                outRot: bDRot,
+                outScale: bDScale,
+                count: count)
+        
+        // Apply deformation to canonical Gaussians
+        if let cmdC = queue.makeCommandBuffer(),
+           let enc = cmdC.makeComputeCommandEncoder() {
+            enc.label = "Init: Apply"
+            enc.setComputePipelineState(applyPipe)
+            enc.setBuffer(cBuffer, offset: 0, index: 0)
+            enc.setBuffer(bDXYZ, offset: 0, index: 1)
+            enc.setBuffer(bDRot, offset: 0, index: 2)
+            enc.setBuffer(bDScale, offset: 0, index: 3)
+            enc.setBuffer(splatBuffer.buffer, offset: 0, index: 4)
+            let w = applyPipe.threadExecutionWidth
+            enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
+            enc.endEncoding()
+            cmdC.commit()
+            cmdC.waitUntilCompleted()
+        }
         print("Loaded Deformable Scene: \(canonicalSplats.count) points")
     }
     
@@ -496,44 +581,76 @@ public class SplatRenderer {
         return points
     }
     
-    private func buildDeformationPipeline() throws {
-        let library = try device.makeDefaultLibrary(bundle: Bundle.module)
-        // Ensure "deformSplats" matches the name in your Deform.metal file
-        let function = library.makeFunction(name: "deformSplats")!
-        self.deformationPipeline = try device.makeComputePipelineState(function: function)
-    }
-    
     public func update(time: Float, commandBuffer: MTLCommandBuffer) {
-        guard let pipeline = deformationPipeline,
-              let inBuffer = canonicalBuffer?.buffer, // This is optional, so we unwrap it
-              let weightBuffer = mlpWeightsBuffer else { return }
-
-        let outBuffer = splatBuffer.buffer
+        // Check if time changed significantly
+        if abs(time - lastDeformationTime) < 0.001 { return }
         
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        Self.log.debug("Deformation time: \(time)")
+        lastDeformationTime = time
         
-        encoder.label = "Deformation Pass"
-        encoder.setComputePipelineState(pipeline)
-        
-        encoder.setBuffer(inBuffer, offset: 0, index: 0)
-        encoder.setBuffer(outBuffer, offset: 0, index: 1)
-        
-        var timeVal = time
-        encoder.setBytes(&timeVal, length: MemoryLayout<Float>.size, index: 2)
-        encoder.setBuffer(weightBuffer, offset: 0, index: 3)
-        
+        let commandQueue = commandBuffer.commandQueue
         let count = canonicalBuffer?.count ?? 0
-        let w = pipeline.threadExecutionWidth // Usually 32 or 64
         
-        let threads = MTLSize(width: count, height: 1, depth: 1)
+        guard count > 0,
+              let sys = deformSystem,
+              let extractPipe = extractPipeline,
+              let applyPipe = applyPipeline,
+              let bXYZ = bufXYZ,
+              let bT = bufT,
+              let bDXYZ = bufDXYZ,
+              let bDRot = bufDRot,
+              let bDScale = bufDScale,
+              let cBuffer = canonicalBuffer?.buffer
+        else {
+            Self.log.debug("Something is missing.")
+            return
+        }
         
-        let threadgroupSize = MTLSize(width: w, height: 1, depth: 1)
+        // Extract xyz from canonical Gaussians and send t
+        if let extractCmd = commandQueue.makeCommandBuffer(),
+           let enc = extractCmd.makeComputeCommandEncoder() {
+            
+            enc.label = "Update: Extract Inputs"
+            enc.setComputePipelineState(extractPipe)
+            enc.setBuffer(cBuffer, offset: 0, index: 0)
+            enc.setBuffer(bXYZ, offset: 0, index: 1)
+            enc.setBuffer(bT, offset: 0, index: 2)
+            var t = time
+            enc.setBytes(&t, length: 4, index: 3)
+            
+            let w = extractPipe.threadExecutionWidth
+            enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
+            enc.endEncoding()
+            
+            extractCmd.commit()
+            extractCmd.waitUntilCompleted() // CPU Wait: Ensures data is ready for Graph
+        }
         
-        encoder.dispatchThreads(threads, threadsPerThreadgroup: threadgroupSize)
-//        let threadsPerGrid = MTLSize(width: count, height: 1, depth: 1)
-//        let threadsPerGroup = MTLSize(width: pipeline.maxTotalThreadsPerThreadgroup, height: 1, depth: 1)
-//        encoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerGroup)
-        encoder.endEncoding()
+        // Calculate d_xyz, d_rotation, d_scaling
+        sys.run(commandQueue: commandQueue,
+                xyzBuffer: bXYZ,
+                tBuffer: bT,
+                outXYZ: bDXYZ,
+                outRot: bDRot,
+                outScale: bDScale,
+                count: count)
+        
+        // Apply deformation to canonical Gaussians
+        if let enc = commandBuffer.makeComputeCommandEncoder() {
+            enc.label = "Update: Apply Outputs"
+            enc.setComputePipelineState(applyPipe)
+            enc.setBuffer(cBuffer, offset: 0, index: 0)
+            enc.setBuffer(bDXYZ, offset: 0, index: 1)
+            enc.setBuffer(bDRot, offset: 0, index: 2)
+            enc.setBuffer(bDScale, offset: 0, index: 3)
+            enc.setBuffer(splatBuffer.buffer, offset: 0, index: 4)
+            
+            let w = applyPipe.threadExecutionWidth
+            enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
+            enc.endEncoding()
+        }
     }
 
     private static func cameraWorldForward(forViewMatrix view: simd_float4x4) -> simd_float3 {

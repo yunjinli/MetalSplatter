@@ -9,8 +9,57 @@ private typealias ViewRepresentable = NSViewRepresentable
 private typealias ViewRepresentable = UIViewRepresentable
 #endif
 
-struct MetalKitSceneView: ViewRepresentable {
+
+struct MetalKitSceneView: View {
     var modelIdentifier: ModelIdentifier?
+    
+    // State for the slider
+    @State private var time: Float = 0.0
+    @State private var isManualTime: Bool = true
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            MetalView(modelIdentifier: modelIdentifier, manualTime: isManualTime ? time : nil)
+                .ignoresSafeArea()
+
+            // UI Overlay
+            VStack(spacing: 12) {
+                if isManualTime {
+                    HStack {
+                        Text("Time:")
+                            .font(.subheadline)
+                            .bold()
+                            .foregroundStyle(.white)
+                        
+                        Text(String(format: "%.2f", time))
+                            .font(.system(.body, design: .monospaced))
+                            .foregroundStyle(.white)
+                            .frame(width: 45, alignment: .leading)
+
+                        Slider(value: $time, in: 0...1)
+                            .accentColor(.blue)
+                    }
+                    .padding(.horizontal)
+                    .padding(.vertical, 8)
+                    .background(.ultraThinMaterial)
+                    .cornerRadius(8)
+                }
+
+                Toggle("Manual Time Control", isOn: $isManualTime)
+                    .toggleStyle(.button)
+                    .padding(8)
+                    .background(.ultraThinMaterial)
+                    .cornerRadius(8)
+            }
+            .padding()
+            .frame(maxWidth: 400)
+        }
+    }
+}
+
+private struct MetalView: ViewRepresentable {
+    var modelIdentifier: ModelIdentifier?
+    var manualTime: Float?
 
     class Coordinator: NSObject {
         var renderer: MetalKitSceneRenderer?
@@ -52,7 +101,7 @@ struct MetalKitSceneView: ViewRepresentable {
                 renderer.cameraDistance = min(max(newDistance, -20.0), -0.5)
             }
         }
-#endif
+#endif // os(iOS)
     }
 
     func makeCoordinator() -> Coordinator {
@@ -81,6 +130,7 @@ struct MetalKitSceneView: ViewRepresentable {
     }
 
     func updateNSView(_ view: MTKView, context: Context) {
+        context.coordinator.renderer?.manualTime = manualTime
         updateView(context.coordinator)
     }
     
@@ -132,9 +182,10 @@ struct MetalKitSceneView: ViewRepresentable {
             }
         }
     }
-#endif
+#endif // os(macOS)
+
 #if os(iOS)
-    func makeUIView(context: UIViewRepresentableContext<MetalKitSceneView>) -> MTKView {
+    func makeUIView(context: UIViewRepresentableContext<MetalView>) -> MTKView {
         let metalKitView = MTKView()
 
         if let metalDevice = MTLCreateSystemDefaultDevice() {
@@ -159,14 +210,19 @@ struct MetalKitSceneView: ViewRepresentable {
         
         return metalKitView
     }
+    
     func updateUIView(_ view: MTKView, context: Context) {
+        context.coordinator.renderer?.manualTime = manualTime
         updateView(context.coordinator)
     }
-#endif
+#endif // os(iOS)
+
     private func loadModel(_ renderer: MetalKitSceneRenderer?) {
         Task {
             do {
-                try await renderer?.load(modelIdentifier)
+                if let modelIdentifier = modelIdentifier {
+                    try await renderer?.load(modelIdentifier)
+                }
             } catch {
                 print("Error loading model: \(error.localizedDescription)")
             }
@@ -177,7 +233,9 @@ struct MetalKitSceneView: ViewRepresentable {
         guard let renderer = coordinator.renderer else { return }
         Task {
             do {
-                try await renderer.load(modelIdentifier)
+                if let modelIdentifier = modelIdentifier {
+                    try await renderer.load(modelIdentifier)
+                }
             } catch {
                 print("Error loading model: \(error.localizedDescription)")
             }
